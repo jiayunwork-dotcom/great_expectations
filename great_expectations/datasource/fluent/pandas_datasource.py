@@ -229,6 +229,31 @@ work-around, until "type" naming convention and method for obtaining 'reader_met
             partitioner=None,
         )
 
+    @public_api
+    def add_batch_definition_whole_dataframe_stream(self, name: str) -> BatchDefinition:
+        """
+        Add a BatchDefinition that requests the whole dataframe-chunk stream.
+
+        The resulting definition selects the one logical batch formed by every chunk the
+        stream source yields.  The source is supplied at run time via
+        ``batch_parameters={'dataframe_chunks': source}`` and is never persisted.
+
+        Args:
+            name: The name of the BatchDefinition.
+
+        Returns:
+            A BatchDefinition with no partitioning.
+        """
+        if not isinstance(self, DataFrameStreamAsset):
+            raise PandasDatasourceError(  # noqa: TRY003 # FIXME CoP
+                "add_batch_definition_whole_dataframe_stream() is only supported on a "
+                "DataFrameStreamAsset created with add_dataframe_stream_asset()."
+            )
+        return self.add_batch_definition(
+            name=name,
+            partitioner=None,
+        )
+
     @override
     def _validate_batch_request(self, batch_request: BatchRequest) -> None:
         """Validates the batch_request has the correct form.
@@ -496,6 +521,152 @@ class DataFrameAsset(_PandasDataAsset):
         )
 
 
+class DataFrameStreamAsset(_PandasDataAsset):
+    """A Data Asset backed by a one-shot stream of Pandas DataFrame chunks.
+
+    Each chunk is a fragment of a single logical batch; row counts, missing rates and
+    statistics are interpreted over all chunks together.  The source is a synchronous
+    iterable that must yield at least one chunk and is only guaranteed to be consumable
+    once.  It is never serialized into a datasource config: only the asset identity is.
+    """
+
+    type: Literal["dataframe_stream"] = "dataframe_stream"
+
+    class Config:
+        extra = pydantic.Extra.forbid
+
+    @override
+    def _get_reader_method(self) -> str:
+        raise NotImplementedError(
+            """DataFrameStreamAsset does not implement "_get_reader_method()", because chunks are provided at runtime."""  # noqa: E501 # FIXME CoP
+        )
+
+    @override
+    def build_batch_request(
+        self,
+        options: Optional[BatchParameters] = None,
+        batch_slice: Optional[BatchSlice] = None,
+        partitioner: Optional[ColumnPartitioner] = None,
+    ) -> BatchRequest:
+        """Build a BatchRequest carrying the ``dataframe_chunks`` source.
+
+        Args:
+            options: Must contain exactly one key, ``'dataframe_chunks'``, whose value is a
+                synchronous iterable of ``pandas.DataFrame`` objects.
+            batch_slice: Not supported; must be None.
+            partitioner: Not supported; must be None.
+        """
+        if batch_slice is not None:
+            raise BuildBatchRequestError(
+                message="batch_slice is not currently supported for this DataAsset "
+                "and must be None."
+            )
+        if partitioner is not None:
+            raise BuildBatchRequestError(
+                message="partitioner is not currently supported for this DataAsset "
+                "and must be None."
+            )
+        if not (
+            options is not None
+            and "dataframe_chunks" in options
+            and len(options) == 1
+            and options["dataframe_chunks"] is not None
+        ):
+            raise BuildBatchRequestError(
+                message="options must contain exactly 1 key, 'dataframe_chunks'."
+            )
+        return BatchRequest(
+            datasource_name=self.datasource.name,
+            data_asset_name=self.name,
+            options=options,
+        )
+
+    @override
+    def _validate_batch_request(self, batch_request: BatchRequest) -> None:
+        if not (
+            batch_request.datasource_name == self.datasource.name
+            and batch_request.data_asset_name == self.name
+            and batch_request.options
+            and len(batch_request.options) == 1
+            and "dataframe_chunks" in batch_request.options
+            and batch_request.options["dataframe_chunks"] is not None
+        ):
+            expect_batch_request_form = BatchRequest[None](
+                datasource_name=self.datasource.name,
+                data_asset_name=self.name,
+                options={"dataframe_chunks": "<DataFrame iterable>"},
+                batch_slice=batch_request._batch_slice_input,
+            )
+            raise gx_exceptions.InvalidBatchRequestError(  # noqa: TRY003 # FIXME CoP
+                "BatchRequest should have form:\n"
+                f"{pf(expect_batch_request_form.dict())}\n"
+                f"but actually has form:\n{pf(batch_request.dict())}\n"
+            )
+
+    @override
+    def get_batch_identifiers_list(self, batch_request: BatchRequest) -> List[dict]:
+        return [IDDict(batch_request.options)]
+
+    @override
+    def get_batch(self, batch_request: BatchRequest) -> Batch:
+        from great_expectations.core.batch_spec import (
+            BatchMarkers,
+            DataframeChunksBatchSpec,
+        )
+        from great_expectations.execution_engine.streaming.batch_data import (
+            StreamingBatchData,
+        )
+
+        self._validate_batch_request(batch_request)
+
+        from great_expectations.constants import DATAFRAME_CHUNKS_REPLACEMENT_STR
+
+        source = batch_request.options["dataframe_chunks"]
+        # Never embed the source in the batch spec: an id/metadata placeholder keeps the
+        # spec serializable while StreamingBatchData holds the live one-shot source.
+        batch_spec = DataframeChunksBatchSpec(
+            dataframe_chunks=DATAFRAME_CHUNKS_REPLACEMENT_STR
+        )
+        execution_engine: PandasExecutionEngine = self.datasource.get_execution_engine()
+
+        # Preparing the Batch must not read data: wrap the source without iterating it.
+        data = StreamingBatchData(
+            execution_engine=execution_engine,
+            dataframe_chunks=source,
+            batch_spec=batch_spec,
+        )
+        markers = BatchMarkers({"ge_load_time": _batch_load_time()})
+
+        batch_definition = LegacyBatchDefinition(
+            datasource_name=self.datasource.name,
+            data_connector_name=_DATA_CONNECTOR_NAME,
+            data_asset_name=self.name,
+            batch_identifiers=make_batch_identifier(batch_request.options),
+            batch_spec_passthrough=None,
+        )
+
+        batch_metadata: BatchMetadata = self._get_batch_metadata_from_batch_request(
+            batch_request=batch_request, ignore_options=("dataframe_chunks",)
+        )
+
+        return Batch(
+            datasource=self.datasource,
+            data_asset=self,
+            batch_request=batch_request,
+            data=data,
+            metadata=batch_metadata,
+            batch_markers=markers,
+            batch_spec=batch_spec,
+            batch_definition=batch_definition,
+        )
+
+
+def _batch_load_time() -> str:
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+
+
 class _PandasDatasource(Datasource, Generic[_DataAssetT]):
     # class attributes
     asset_types: ClassVar[Sequence[Type[DataAsset]]] = []
@@ -633,7 +804,10 @@ class PandasDatasource(_PandasDatasource):
     ADD_READER_METHODS: ClassVar[bool] = True
 
     # class attributes
-    asset_types: ClassVar[Sequence[Type[DataAsset]]] = _DYNAMIC_ASSET_TYPES + [DataFrameAsset]
+    asset_types: ClassVar[Sequence[Type[DataAsset]]] = _DYNAMIC_ASSET_TYPES + [
+        DataFrameAsset,
+        DataFrameStreamAsset,
+    ]
 
     # instance attributes
     type: Literal["pandas"] = "pandas"
@@ -675,6 +849,11 @@ class PandasDatasource(_PandasDatasource):
                 )
 
             batch_request = asset.build_batch_request(options={"dataframe": dataframe})
+        elif isinstance(asset, DataFrameStreamAsset):
+            raise ValueError(  # noqa: TRY003, TRY004 # FIXME CoP
+                "DataFrameStreamAsset batches are created from a dataframe_chunks source via "
+                "BatchDefinition.get_batch(batch_parameters={'dataframe_chunks': source})."
+            )
         else:
             batch_request = asset.build_batch_request()
 
@@ -697,6 +876,28 @@ class PandasDatasource(_PandasDatasource):
             The DataFrameAsset that has been added to this datasource.
         """  # noqa: E501 # FIXME CoP
         asset: DataFrameAsset = DataFrameAsset(
+            name=name,
+            batch_metadata=batch_metadata or {},
+        )
+        return self._add_asset(asset=asset)
+
+    @public_api
+    def add_dataframe_stream_asset(
+        self,
+        name: str,
+        batch_metadata: Optional[BatchMetadata] = None,
+    ) -> DataFrameStreamAsset:
+        """Adds a one-shot DataFrame-chunk stream DataAsset to this PandasDatasource.
+
+        Args:
+            name: The name of the asset. This can be any arbitrary string.
+            batch_metadata: An arbitrary user defined dictionary with string keys which
+                will get inherited by any batches created from the asset.
+
+        Returns:
+            The DataFrameStreamAsset that has been added to this datasource.
+        """
+        asset = DataFrameStreamAsset(
             name=name,
             batch_metadata=batch_metadata or {},
         )

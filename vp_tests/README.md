@@ -109,3 +109,12 @@ persists the result, and the result survives a JSON round trip including
 It runs the 57 feature tests plus the touched GE regression suites. The wrapper
 pins an isolated pytest config because this container lacks the en_US locale,
 sqlalchemy and spark assumed by the repository's top-level config.
+
+## Dataframe-chunk streaming validation
+
+See [STREAMING.md](STREAMING.md) for the one-shot chunk-stream design: fluent asset,
+`add_batch_definition_whole_dataframe_stream`, the shared single-pass scan, the
+provider capability/state protocol, the batch structure contract, pre-source rejection,
+result reporting (positions + no fabricated frequencies) and the memory-scale probe.
+The streaming tests live in `test_streaming_*.py` and `stream_harness.py` /
+`stream_custom_provider.py`.

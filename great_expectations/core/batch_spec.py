@@ -192,6 +192,40 @@ class RuntimeDataBatchSpec(BatchSpec):
         self["batch_data"] = batch_data
 
 
+class DataframeChunksBatchSpec(BatchSpec):
+    """BatchSpec for a one-shot, synchronous iterable of DataFrame chunks.
+
+    The chunks together form a single logical batch.  Only a placeholder is ever stored in
+    the spec -- the live source is held transiently by
+    :class:`~great_expectations.execution_engine.streaming.batch_data.StreamingBatchData`,
+    never by the spec, so the spec can be serialized into result metadata without embedding
+    the source.
+    """
+
+    _id_ignore_keys = {"batch_data", "dataframe_chunks"}
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self.get("batch_data") is None and self.get("dataframe_chunks") is None:
+            raise InvalidBatchSpecError(  # noqa: TRY003 # FIXME CoP
+                "DataframeChunksBatchSpec requires a 'dataframe_chunks' source"
+            )
+
+    @property
+    def batch_data(self):
+        return self.get("batch_data", self.get("dataframe_chunks"))
+
+    @batch_data.setter
+    def batch_data(self, batch_data) -> None:
+        self["batch_data"] = batch_data
+
+    def to_json_dict(self) -> dict:
+        from great_expectations.constants import DATAFRAME_CHUNKS_REPLACEMENT_STR
+
+        return {"batch_data": DATAFRAME_CHUNKS_REPLACEMENT_STR}
+
+
+
 class RuntimeQueryBatchSpec(BatchSpec):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

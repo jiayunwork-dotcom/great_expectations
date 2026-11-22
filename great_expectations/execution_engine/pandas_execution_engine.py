@@ -208,11 +208,15 @@ class PandasExecutionEngine(ExecutionEngine[str]):
         batch_id: str,
         batch_data: Union[PandasBatchData, pd.DataFrame],  # type: ignore[override] # FIXME CoP
     ) -> None:
+        from great_expectations.execution_engine.streaming.batch_data import (
+            StreamingBatchData,
+        )
+
         if isinstance(batch_data, pd.DataFrame):
             batch_data = PandasBatchData(self, batch_data)
-        elif not isinstance(batch_data, PandasBatchData):
+        elif not isinstance(batch_data, (PandasBatchData, StreamingBatchData)):
             raise gx_exceptions.GreatExpectationsError(  # noqa: TRY003 # FIXME CoP
-                "PandasExecutionEngine requires batch data that is either a DataFrame or a PandasBatchData object"  # noqa: E501 # FIXME CoP
+                "PandasExecutionEngine requires batch data that is either a DataFrame, a PandasBatchData object, or a StreamingBatchData object"  # noqa: E501 # FIXME CoP
             )
 
         super().load_batch_data(batch_id=batch_id, batch_data=batch_data)

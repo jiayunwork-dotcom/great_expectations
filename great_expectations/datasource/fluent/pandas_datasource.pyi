@@ -135,6 +135,22 @@ class DataFrameAsset(_PandasDataAsset):
     @override
     def get_batch_identifiers_list(self, batch_request: BatchRequest) -> List[dict]: ...
 
+class DataFrameStreamAsset(_PandasDataAsset):
+    type: Literal["dataframe_stream"]
+
+    @override
+    def build_batch_request(
+        self,
+        options: Optional[BatchParameters] = ...,
+        batch_slice: Optional[BatchSlice] = ...,
+        partitioner: Optional[ColumnPartitioner] = ...,
+    ) -> BatchRequest: ...
+    @override
+    def get_batch(self, batch_request: BatchRequest) -> Batch: ...
+    @override
+    def get_batch_identifiers_list(self, batch_request: BatchRequest) -> List[dict]: ...
+    def add_batch_definition_whole_dataframe_stream(self, name: str) -> BatchDefinition: ...
+
 _PandasDataAssetT = TypeVar("_PandasDataAssetT", bound=_PandasDataAsset)
 
 class _PandasDatasource(Datasource):
@@ -181,6 +197,11 @@ class PandasDatasource(_PandasDatasource):
         dataframe: Optional[pd.DataFrame] = ...,
         batch_metadata: Optional[BatchMetadata] = ...,
     ) -> DataFrameAsset: ...
+    def add_dataframe_stream_asset(
+        self,
+        name: str,
+        batch_metadata: Optional[BatchMetadata] = ...,
+    ) -> DataFrameStreamAsset: ...
     def read_dataframe(
         self,
         dataframe: pd.DataFrame,

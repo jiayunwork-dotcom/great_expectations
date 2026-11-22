@@ -11,7 +11,10 @@ from great_expectations.compatibility.pydantic import (
     ValidationError,
     validator,
 )
-from great_expectations.constants import DATAFRAME_REPLACEMENT_STR
+from great_expectations.constants import (
+    DATAFRAME_CHUNKS_REPLACEMENT_STR,
+    DATAFRAME_REPLACEMENT_STR,
+)
 from great_expectations.core.batch_definition import BatchDefinition
 from great_expectations.core.expectation_suite import (
     ExpectationSuite,
@@ -306,6 +309,8 @@ class ValidationDefinition(BaseModel):
             batch_parameters_copy = {k: v for k, v in batch_parameters.items()}
             if "dataframe" in batch_parameters_copy:
                 batch_parameters_copy["dataframe"] = DATAFRAME_REPLACEMENT_STR
+            if "dataframe_chunks" in batch_parameters_copy:
+                batch_parameters_copy["dataframe_chunks"] = DATAFRAME_CHUNKS_REPLACEMENT_STR
             results.meta["batch_parameters"] = batch_parameters_copy
         else:
             results.meta["batch_parameters"] = None

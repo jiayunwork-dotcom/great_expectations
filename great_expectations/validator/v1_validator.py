@@ -54,6 +54,27 @@ class Validator:
         expectation_parameters: Optional[SuiteParameterDict] = None,
     ) -> ExpectationValidationResult:
         """Run a single expectation against the batch definition"""
+        streaming = self._streaming_batch_data()
+        if streaming is not None:
+            from great_expectations.execution_engine.streaming.engine import (
+                run_streaming_validation,
+            )
+
+            runtime_configuration = self._runtime_configuration()
+            processed = self._wrapped_validator.process_expectations_for_validation(
+                [expectation.configuration], expectation_parameters
+            )
+            results, _streaming_meta = run_streaming_validation(
+                validator=self._wrapped_validator,
+                streaming_batch_data=streaming,
+                expectation_configurations=processed,
+                runtime_configuration=runtime_configuration,
+                catch_exceptions=bool(runtime_configuration.get("catch_exceptions", True)),
+                validation_plan=None,
+            )
+            assert len(results) == 1
+            return results[0]
+
         results = self._validate_expectation_configs(
             expectation_configs=[expectation.configuration],
             expectation_parameters=expectation_parameters,
@@ -68,6 +89,14 @@ class Validator:
         expectation_parameters: Optional[SuiteParameterDict] = None,
     ) -> ExpectationSuiteValidationResult:
         """Run an expectation suite against the batch definition"""
+        streaming = self._streaming_batch_data()
+        if streaming is not None:
+            return self._validate_streaming_suite(
+                expectation_suite=expectation_suite,
+                expectation_parameters=expectation_parameters,
+                streaming_batch_data=streaming,
+            )
+
         results = self._validate_expectation_configs(
             expectation_configs=expectation_suite.expectation_configurations,
             expectation_parameters=expectation_parameters,
@@ -101,6 +130,88 @@ class Validator:
             },
             batch_id=self.active_batch_id,
         )
+
+    # ------------------------------------------------------------------ streaming
+    def _streaming_batch_data(self):
+        """Return the loaded StreamingBatchData for this validation, or ``None``.
+
+        The wrapped validator is created from the batch request exactly as the ordinary
+        path does; for a streaming batch it holds a ``StreamingBatchData`` placeholder that
+        has not read the source yet.
+        """
+        from great_expectations.execution_engine.streaming.batch_data import (
+            StreamingBatchData,
+        )
+
+        batch_manager = self._wrapped_validator.execution_engine.batch_manager
+        active_id = batch_manager.active_batch_data_id
+        if active_id is None:
+            return None
+        active = batch_manager.batch_data_cache.get(active_id)
+        if isinstance(active, StreamingBatchData):
+            return active
+        return None
+
+    def _validate_streaming_suite(
+        self,
+        *,
+        expectation_suite: ExpectationSuite,
+        expectation_parameters: Optional[SuiteParameterDict],
+        streaming_batch_data,
+    ) -> ExpectationSuiteValidationResult:
+        from great_expectations.execution_engine.streaming.engine import (
+            run_streaming_validation,
+        )
+
+        runtime_configuration = self._runtime_configuration()
+
+        # Suite parameters are substituted before graph construction, exactly as the
+        # ordinary path does, so thresholds are finalized before pre-source checks.
+        processed = self._wrapped_validator.process_expectations_for_validation(
+            expectation_suite.expectation_configurations,
+            expectation_parameters,
+        )
+
+        results, streaming_meta = run_streaming_validation(
+            validator=self._wrapped_validator,
+            streaming_batch_data=streaming_batch_data,
+            expectation_configurations=processed,
+            runtime_configuration=runtime_configuration,
+            catch_exceptions=bool(runtime_configuration.get("catch_exceptions", True)),
+            validation_plan=expectation_suite.validation_plan,
+        )
+
+        statistics = calc_validation_statistics(results)
+
+        batch_spec = self._wrapped_validator.active_batch_spec
+        return ExpectationSuiteValidationResult(
+            results=results,
+            success=statistics.success,
+            suite_name=expectation_suite.name,
+            statistics={
+                "evaluated_expectations": statistics.evaluated_expectations,
+                "successful_expectations": statistics.successful_expectations,
+                "unsuccessful_expectations": statistics.unsuccessful_expectations,
+                "success_percent": statistics.success_percent,
+                "declared_expectations": statistics.declared_expectations,
+                "skipped_expectations": statistics.skipped_expectations,
+            },
+            meta={
+                "great_expectations_version": ge_version,
+                "batch_spec": convert_to_json_serializable(batch_spec),
+                "batch_markers": self._wrapped_validator.active_batch_markers,
+                "active_batch_definition": convert_to_json_serializable(
+                    self._wrapped_validator.active_batch_definition
+                ),
+                "streaming": streaming_meta,
+            },
+            batch_id=self.active_batch_id,
+        )
+
+    def _runtime_configuration(self) -> dict:
+        if isinstance(self.result_format, ResultFormat):
+            return {"result_format": copy(self.result_format.value)}
+        return {"result_format": copy(self.result_format)}
 
     @property
     def active_batch_id(self) -> Optional[str]:

@@ -430,6 +430,111 @@ class UnavailableMetricError(MetricError):
     pass
 
 
+class StreamingValidationError(GreatExpectationsError):
+    """Base class for errors raised by the dataframe-chunk streaming validation path."""
+
+
+class StreamPreSourceValidationError(StreamingValidationError):
+    """A capability/configuration rejection detected before the stream source is touched.
+
+    Raises of this type guarantee that ``source.__iter__`` has not been called. They are
+    configuration errors (not rule/metric exceptions) and are never swallowed by
+    ``catch_exceptions``.
+    """
+
+
+class StreamUnsupportedMetricError(StreamPreSourceValidationError):
+    def __init__(self, metric_name: str, reason: str | None = None) -> None:
+        detail = f" ({reason})" if reason else ""
+        super().__init__(
+            f"Metric '{metric_name}' has no streaming provider and cannot be computed over a "
+            f"dataframe chunk stream{detail}. Rejected before the source was iterated."
+        )
+        self.metric_name = metric_name
+
+
+class StreamRowConditionError(StreamPreSourceValidationError):
+    def __init__(self, expectation_type: str) -> None:
+        super().__init__(
+            "row_condition is not supported for dataframe chunk streaming validation "
+            f"(expectation '{expectation_type}'). Rejected before the source was iterated."
+        )
+
+
+class StreamEngineError(StreamPreSourceValidationError):
+    def __init__(self, engine_name: str) -> None:
+        super().__init__(
+            f"Dataframe chunk streaming validation requires a Pandas execution engine, got "
+            f"'{engine_name}'. Rejected before the source was iterated."
+        )
+
+
+class StreamValidationPlanError(StreamPreSourceValidationError):
+    def __init__(self) -> None:
+        super().__init__(
+            "A non-empty validation_plan is not supported for dataframe chunk streaming "
+            "validation. Rejected before the source was iterated."
+        )
+
+
+class StreamResultFormatError(StreamPreSourceValidationError):
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            f"Result format is not supported for dataframe chunk streaming validation: {reason}. "
+            "Rejected before the source was iterated."
+        )
+
+
+class StreamSourceReuseError(StreamingValidationError):
+    def __init__(self) -> None:
+        super().__init__(
+            "This dataframe chunk source has already been consumed by a validation. A "
+            "dataframe-chunk source is one-shot; create a new Batch with a new source to run "
+            "again."
+        )
+
+
+class StreamBatchStructureError(StreamingValidationError):
+    """Raised when the chunk stream violates the logical-batch structure contract.
+
+    This is a batch error, not a rule/metric exception, so ``catch_exceptions`` never
+    swallows it.
+    """
+
+    def __init__(self, message: str, *, chunk_index: int | None = None) -> None:
+        self.chunk_index = chunk_index
+        location = f" at chunk index {chunk_index}" if chunk_index is not None else ""
+        super().__init__(f"Invalid dataframe chunk stream{location}: {message}")
+
+
+class StreamingMetricDataError(MetricError):
+    """Raised by a streaming numeric aggregate for a non-real or non-finite column value.
+
+    Carries locatable context so the failure can be attributed to a batch/column/chunk.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        batch_id: str | None = None,
+        column: str | None = None,
+        chunk_index: int | None = None,
+    ) -> None:
+        self.batch_id = batch_id
+        self.column = column
+        self.chunk_index = chunk_index
+        locations = []
+        if batch_id is not None:
+            locations.append(f"batch_id={batch_id!r}")
+        if column is not None:
+            locations.append(f"column={column!r}")
+        if chunk_index is not None:
+            locations.append(f"chunk_index={chunk_index}")
+        suffix = f" [{', '.join(locations)}]" if locations else ""
+        super().__init__(f"{message}{suffix}")
+
+
 class MetricProviderError(MetricError):
     pass
 
