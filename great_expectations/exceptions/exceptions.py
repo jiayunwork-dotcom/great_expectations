@@ -219,6 +219,10 @@ class InvalidExpectationConfigurationError(GreatExpectationsError):
     pass
 
 
+class InvalidValidationPlanError(GreatExpectationsError):
+    pass
+
+
 class ExpectationNotFoundError(GreatExpectationsError):
     pass
 

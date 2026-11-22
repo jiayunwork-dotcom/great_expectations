@@ -40,6 +40,7 @@ from .exceptions import (
     InvalidKeyError,
     InvalidMetricAccessorDomainKwargsKeyError,
     InvalidTopLevelConfigKeyError,
+    InvalidValidationPlanError,
     MetricComputationError,
     MetricError,
     MetricProviderError,

@@ -43,6 +43,7 @@ from great_expectations.data_context.types.base import CheckpointValidationDefin
 from great_expectations.exceptions import (
     GreatExpectationsError,
     InvalidExpectationConfigurationError,
+    InvalidValidationPlanError,
 )
 from great_expectations.execution_engine.pandas_batch_data import PandasBatchData
 from great_expectations.expectations.expectation_configuration import (
@@ -82,6 +83,10 @@ if TYPE_CHECKING:
         LegacyBatchDefinition,
     )
     from great_expectations.core.id_dict import BatchSpec
+    from great_expectations.core.validation_plan import (
+        ValidationPlan,
+        ValidationPlanRule,
+    )
     from great_expectations.data_context.data_context import AbstractDataContext
     from great_expectations.datasource.fluent.interfaces import Batch as FluentBatch
     from great_expectations.execution_engine import ExecutionEngine
@@ -566,6 +571,7 @@ class Validator:
         self,
         configurations: List[ExpectationConfiguration],
         runtime_configuration: Optional[dict] = None,
+        validation_plan: Optional[ValidationPlan] = None,
     ) -> List[ExpectationValidationResult]:
         """Obtains validation dependencies for each metric using the implementation of their
         associated expectation, then proceeds to add these dependencies to the validation graph,
@@ -577,6 +583,10 @@ class Validator:
             Configurations that will be used to supply domain and values for metrics.
             runtime_configuration (dict): A dictionary of runtime keyword arguments, controlling
             semantics, such as the result_format.
+            validation_plan (ValidationPlan): Optional dependency plan. When provided, rules are
+                unlocked layer by layer: a rule only runs once every prerequisite rule has
+                succeeded; rules blocked by a failed, errored or skipped prerequisite are
+                reported as skipped and never touch their expectation callbacks or metrics.
 
         Returns:
             A list of Validations, validating that all necessary metrics are available.
@@ -589,6 +599,26 @@ class Validator:
         else:
             catch_exceptions = False
 
+        if validation_plan is None:
+            return self._graph_validate_without_plan(
+                configurations=configurations,
+                runtime_configuration=runtime_configuration,
+                catch_exceptions=catch_exceptions,
+            )
+
+        return self._graph_validate_with_plan(
+            configurations=configurations,
+            runtime_configuration=runtime_configuration,
+            catch_exceptions=catch_exceptions,
+            validation_plan=validation_plan,
+        )
+
+    def _graph_validate_without_plan(
+        self,
+        configurations: List[ExpectationConfiguration],
+        runtime_configuration: dict,
+        catch_exceptions: bool,
+    ) -> List[ExpectationValidationResult]:
         expectation_validation_graphs: List[ExpectationValidationGraph]
 
         evrs: List[ExpectationValidationResult]
@@ -666,6 +696,246 @@ class Validator:
                     raise err  # noqa: TRY201 # FIXME CoP
 
         return evrs
+
+    def _graph_validate_with_plan(
+        self,
+        configurations: List[ExpectationConfiguration],
+        runtime_configuration: dict,
+        catch_exceptions: bool,
+        validation_plan: ValidationPlan,
+    ) -> List[ExpectationValidationResult]:
+        # The plan has already been validated against this exact suite, but mapping
+        # configurations to rules here also guards against reordered inputs.
+        configurations_by_expectation_id: Dict[str, ExpectationConfiguration] = {}
+        for configuration in configurations:
+            if configuration.id is None:
+                raise InvalidValidationPlanError(
+                    "validation_plan can only reference expectations that declare an id."
+                )
+            configurations_by_expectation_id[configuration.id] = configuration
+
+        layers: List[List[ValidationPlanRule]] = validation_plan.execution_layers()
+
+        # State shared across layers: every MetricConfiguration identity is resolved
+        # at most once during this validation, whether it serves one rule or several
+        # rules that unlock at different layers. Failures are retained so they are
+        # never recomputed and only attributed to rules that actually use them.
+        resolved_metrics: _MetricsDict = {}
+        failed_metric_info: _AbortedMetricsInfoDict = {}
+        suite_graph = ValidationGraph(execution_engine=self._execution_engine)
+
+        # Final results keyed by rule id, then emitted in the suite's original order.
+        results_by_rule_id: Dict[str, ExpectationValidationResult] = {}
+        rule_statuses: Dict[str, str] = {}
+        subgraphs_by_rule_id: Dict[str, ExpectationValidationGraph] = {}
+
+        for layer in layers:
+            unlocked_rules: List[ValidationPlanRule] = []
+            for rule in layer:
+                blocked_by = [
+                    prerequisite_id
+                    for prerequisite_id in rule.requires
+                    if rule_statuses.get(prerequisite_id) != "passed"
+                ]
+                if blocked_by:
+                    configuration = configurations_by_expectation_id[rule.expectation_id]
+                    results_by_rule_id[rule.id] = self._build_skipped_result(
+                        configuration=configuration,
+                        rule=rule,
+                        blocked_by=blocked_by,
+                    )
+                    rule_statuses[rule.id] = "skipped"
+                else:
+                    unlocked_rules.append(rule)
+
+            if not unlocked_rules:
+                continue
+
+            layer_configurations = [
+                configurations_by_expectation_id[rule.expectation_id]
+                for rule in unlocked_rules
+            ]
+
+            # Building sub-graphs calls get_validation_dependencies; skipped rules
+            # never reach this point, so their callbacks and providers stay untouched.
+            layer_subgraphs: List[ExpectationValidationGraph] = []
+            layer_evrs: List[ExpectationValidationResult] = []
+            layer_processed: List[ExpectationConfiguration] = []
+            (
+                layer_subgraphs,
+                layer_evrs,
+                layer_processed,
+            ) = self._generate_metric_dependency_subgraphs_for_each_expectation_configuration(
+                expectation_configurations=layer_configurations,
+                processed_configurations=layer_processed,
+                catch_exceptions=catch_exceptions,
+                runtime_configuration=runtime_configuration,
+            )
+            for subgraph in layer_subgraphs:
+                rule = validation_plan.rule_for_expectation(subgraph.configuration.id)
+                subgraphs_by_rule_id[rule.id] = subgraph
+                suite_graph.update(graph=subgraph.graph)
+
+            # A failure while constructing a rule's dependency sub-graph.
+            if layer_evrs:
+                processed_ids = {config.id for config in layer_processed}
+                failed_rules = [
+                    rule
+                    for rule in unlocked_rules
+                    if rule.expectation_id not in processed_ids
+                ]
+                if len(failed_rules) != len(layer_evrs):
+                    # The sub-graph builder emits one error result per rejected
+                    # configuration; a mismatch signals an internal inconsistency.
+                    raise GreatExpectationsError(
+                        "Internal error while building validation dependency sub-graphs: "
+                        f"{len(failed_rules)} rule(s) failed but {len(layer_evrs)} error "
+                        "result(s) were produced."
+                    )
+                for rule, error_result in zip(
+                    failed_rules, layer_evrs, strict=True
+                ):
+                    results_by_rule_id[rule.id] = self._annotate_execution(
+                        result=error_result,
+                        rule=rule,
+                        status="error",
+                    )
+                    rule_statuses[rule.id] = "error"
+
+            if not layer_processed:
+                continue
+
+            try:
+                (
+                    resolved_metrics,
+                    aborted_metrics_info,
+                ) = self._metrics_calculator.resolve_validation_graph(
+                    graph=suite_graph,
+                    runtime_configuration=runtime_configuration,
+                    min_graph_edges_pbar_enable=0,
+                    initial_resolved_metrics=resolved_metrics,
+                    initial_failed_metric_info=failed_metric_info,
+                )
+            except Exception as err:
+                # Unattributable graph-level failure: with catch_exceptions=False it
+                # must propagate immediately, without finishing remaining branches.
+                if not catch_exceptions:
+                    raise err  # noqa: TRY201 # FIXME CoP
+                exception_traceback = traceback.format_exc()
+                for configuration in layer_processed:
+                    rule = validation_plan.rule_for_expectation(configuration.id)
+                    result = self._catch_exceptions_in_failing_expectation_validations(
+                        exception_traceback=exception_traceback,
+                        exception=err,
+                        failing_expectation_configurations=[configuration],
+                        evrs=[],
+                    )[0]
+                    results_by_rule_id[rule.id] = self._annotate_execution(
+                        result=result,
+                        rule=rule,
+                        status="error",
+                    )
+                    rule_statuses[rule.id] = "error"
+                continue
+
+            # Retain failure state for later layers (no recomputation) while the
+            # aborted metrics reported here are only attributed to rules of this
+            # layer that actually depend on them.
+            failed_metric_info = dict(aborted_metrics_info)
+
+            rejected_config_ids: set[str] = set()
+            for configuration in layer_processed:
+                rule = validation_plan.rule_for_expectation(configuration.id)
+                subgraph = subgraphs_by_rule_id[rule.id]
+                metric_exception_info = subgraph.get_exception_info(
+                    metric_info=aborted_metrics_info
+                )
+                if metric_exception_info:
+                    result = ExpectationValidationResult(
+                        success=False,
+                        exception_info=metric_exception_info,
+                        expectation_config=configuration,
+                    )
+                    results_by_rule_id[rule.id] = self._annotate_execution(
+                        result=result,
+                        rule=rule,
+                        status="error",
+                    )
+                    rule_statuses[rule.id] = "error"
+                    rejected_config_ids.add(configuration.id)
+
+            for configuration in layer_processed:
+                if configuration.id in rejected_config_ids:
+                    continue
+                rule = validation_plan.rule_for_expectation(configuration.id)
+                try:
+                    expectation = configuration.to_domain_obj()
+                    result = expectation.metrics_validate(
+                        metrics=resolved_metrics,
+                        execution_engine=self._execution_engine,
+                        runtime_configuration=copy.deepcopy(runtime_configuration),
+                    )
+                    status = "passed" if result.success else "failed"
+                    results_by_rule_id[rule.id] = self._annotate_execution(
+                        result=result,
+                        rule=rule,
+                        status=status,
+                    )
+                    rule_statuses[rule.id] = status
+                except Exception as err:
+                    if not catch_exceptions:
+                        raise err  # noqa: TRY201 # FIXME CoP
+                    exception_traceback = traceback.format_exc()
+                    result = self._catch_exceptions_in_failing_expectation_validations(
+                        exception_traceback=exception_traceback,
+                        exception=err,
+                        failing_expectation_configurations=[configuration],
+                        evrs=[],
+                    )[0]
+                    results_by_rule_id[rule.id] = self._annotate_execution(
+                        result=result,
+                        rule=rule,
+                        status="error",
+                    )
+                    rule_statuses[rule.id] = "error"
+
+        # Emit one result per declared rule, in the order the suite presented them.
+        return [
+            results_by_rule_id[
+                validation_plan.rule_for_expectation(configuration.id).id
+            ]
+            for configuration in configurations
+        ]
+
+    @staticmethod
+    def _annotate_execution(
+        result: ExpectationValidationResult,
+        rule: ValidationPlanRule,
+        status: str,
+    ) -> ExpectationValidationResult:
+        # Preserve any user-provided meta content alongside the execution record.
+        result.meta = dict(result.meta)
+        result.meta["execution"] = {"id": rule.id, "status": status}
+        return result
+
+    @staticmethod
+    def _build_skipped_result(
+        configuration: ExpectationConfiguration,
+        rule: ValidationPlanRule,
+        blocked_by: List[str],
+    ) -> ExpectationValidationResult:
+        # Skipped rules produce no metric calls and therefore no fabricated exception.
+        result = ExpectationValidationResult(
+            success=None,
+            result={},
+            expectation_config=configuration,
+        )
+        result.meta["execution"] = {
+            "id": rule.id,
+            "status": "skipped",
+            "blocked_by": list(blocked_by),
+        }
+        return result
 
     def _generate_metric_dependency_subgraphs_for_each_expectation_configuration(
         self,
@@ -1204,9 +1474,12 @@ class Validator:
                 catch_exceptions=catch_exceptions, result_format=result_format
             )
 
+            validation_plan = expectation_suite.validation_plan
+
             results = self.graph_validate(
                 configurations=expectations_to_evaluate,
                 runtime_configuration=runtime_configuration,
+                validation_plan=validation_plan,
             )
 
             if self._include_rendered_content:
@@ -1216,6 +1489,8 @@ class Validator:
             statistics = calc_validation_statistics(results)
 
             if only_return_failures:
+                # Skipped results carry success=None and are retained alongside
+                # failures and errors; statistics still describe the full run.
                 abbrev_results = []
                 for exp in results:
                     if not exp.success:
@@ -1233,6 +1508,8 @@ class Validator:
                     "successful_expectations": statistics.successful_expectations,
                     "unsuccessful_expectations": statistics.unsuccessful_expectations,
                     "success_percent": statistics.success_percent,
+                    "declared_expectations": statistics.declared_expectations,
+                    "skipped_expectations": statistics.skipped_expectations,
                 },
                 suite_parameters=runtime_suite_parameters,
                 meta={

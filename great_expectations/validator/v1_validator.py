@@ -71,6 +71,7 @@ class Validator:
         results = self._validate_expectation_configs(
             expectation_configs=expectation_suite.expectation_configurations,
             expectation_parameters=expectation_parameters,
+            validation_plan=expectation_suite.validation_plan,
         )
         statistics = calc_validation_statistics(results)
 
@@ -83,6 +84,8 @@ class Validator:
                 "successful_expectations": statistics.successful_expectations,
                 "unsuccessful_expectations": statistics.unsuccessful_expectations,
                 "success_percent": statistics.success_percent,
+                "declared_expectations": statistics.declared_expectations,
+                "skipped_expectations": statistics.skipped_expectations,
             },
             meta={
                 # run_id, validation_time, and fkeys are added to this dict
@@ -118,6 +121,7 @@ class Validator:
         self,
         expectation_configs: list[ExpectationConfiguration],
         expectation_parameters: Optional[SuiteParameterDict] = None,
+        validation_plan=None,
     ) -> list[ExpectationValidationResult]:
         """Run a list of expectation configurations against the batch definition"""
         processed_expectation_configs = self._wrapped_validator.process_expectations_for_validation(
@@ -133,6 +137,7 @@ class Validator:
         results = self._wrapped_validator.graph_validate(
             configurations=processed_expectation_configs,
             runtime_configuration=runtime_configuration,
+            validation_plan=validation_plan,
         )
 
         if self._include_rendered_content:

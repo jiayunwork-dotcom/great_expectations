@@ -232,6 +232,7 @@ class TestValidationRun:
                 )
             ],
             runtime_configuration={"result_format": "SUMMARY"},
+            validation_plan=None,
         )
 
     @mock.patch.object(_PandasDataAsset, "build_batch_request", autospec=True)
@@ -261,6 +262,7 @@ class TestValidationRun:
                 )
             ],
             runtime_configuration={"result_format": "COMPLETE"},
+            validation_plan=None,
         )
 
     @pytest.mark.unit
@@ -285,6 +287,8 @@ class TestValidationRun:
                 "successful_expectations": 1,
                 "unsuccessful_expectations": 0,
                 "success_percent": 100.0,
+                "declared_expectations": 1,
+                "skipped_expectations": 0,
             },
             meta={},
         )
@@ -401,6 +405,7 @@ class TestValidationRun:
                 )
             ],
             runtime_configuration={"result_format": "SUMMARY"},
+            validation_plan=None,
         )
 
         # validate we are calling set on the store with data that's roughly the right shape

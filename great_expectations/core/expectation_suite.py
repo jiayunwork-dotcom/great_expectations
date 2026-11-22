@@ -27,12 +27,17 @@ from great_expectations.core.freshness_diagnostics import (
     ExpectationSuiteFreshnessDiagnostics,
 )
 from great_expectations.core.serdes import _IdentifierBundle
+from great_expectations.core.validation_plan import (
+    VALIDATION_PLAN_META_KEY,
+    ValidationPlan,
+)
 from great_expectations.data_context.data_context.context_factory import project_manager
 from great_expectations.exceptions import (
     ExpectationSuiteError,
     ExpectationSuiteNotAddedError,
     ExpectationSuiteNotFoundError,
     ExpectationSuiteNotFreshError,
+    InvalidValidationPlanError,
     StoreBackendError,
 )
 from great_expectations.exceptions.exceptions import InvalidKeyError
@@ -81,7 +86,7 @@ class ExpectationSuite(SerializableDictDot):
         self.name = name
         self.id = id
 
-        self.expectations = []
+        self.expectations: List[Expectation] = []
         for exp in expectations or []:
             try:
                 self.expectations.append(self._process_expectation(exp))
@@ -104,6 +109,44 @@ class ExpectationSuite(SerializableDictDot):
         ensure_json_serializable(meta)
         self.meta = meta
         self.notes = notes
+
+        # A plan stored in meta must already describe the expectations of this suite.
+        if self.meta.get(VALIDATION_PLAN_META_KEY) is not None:
+            self.validation_plan
+
+    @property
+    def validation_plan(self) -> Optional[ValidationPlan]:
+        """The validation plan declared in ``meta['validation_plan']`` or ``None``.
+
+        Accessing this property parses and fully validates the plan against the
+        suite's current expectations (including coverage), so an out-of-date plan
+        raises :class:`InvalidValidationPlanError` rather than being silently used.
+        """
+        raw_plan = self.meta.get(VALIDATION_PLAN_META_KEY)
+        if raw_plan is None:
+            return None
+        # Every expectation must be referenceable by id for a plan to cover it.
+        idless_indexes = [
+            index
+            for index, expectation in enumerate(self.expectations)
+            if expectation.id is None
+        ]
+        if idless_indexes:
+            raise InvalidValidationPlanError(
+                "validation_plan requires every expectation to declare an id; "
+                f"expectation(s) at suite index(es) {idless_indexes} have no id."
+            )
+        plan = ValidationPlan.from_dict(
+            raw_plan,
+            expectation_ids=self.expectation_ids,
+        )
+        # Keep the stored representation normalized (e.g. tuples become lists).
+        self.meta[VALIDATION_PLAN_META_KEY] = plan.to_dict()
+        return plan
+
+    @property
+    def expectation_ids(self) -> List[str]:
+        return [expectation.id for expectation in self.expectations if expectation.id is not None]
 
     @property
     def _store(self) -> ExpectationsStore:

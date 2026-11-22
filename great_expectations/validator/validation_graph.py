@@ -124,6 +124,12 @@ class ValidationGraph:
             self._edges.append(edge)
             self._edge_ids.add(edge.id)
 
+    def update(self, graph: ValidationGraph) -> None:
+        """Merge every edge of ``graph`` into this graph (duplicates are ignored)."""
+        edge: MetricEdge
+        for edge in graph.edges:
+            self.add(edge=edge)
+
     def build_metric_dependency_graph(
         self,
         metric_configuration: MetricConfiguration,
@@ -209,11 +215,17 @@ class ValidationGraph:
         min_graph_edges_pbar_enable: int = 0,
         # Set to low number (e.g., 3) to suppress progress bar for small graphs.
         show_progress_bars: bool = True,
+        initial_resolved_metrics: Optional[
+            Dict[MetricConfigurationID, MetricValue]
+        ] = None,
+        initial_failed_metric_info: Optional[_AbortedMetricsInfoDict] = None,
     ) -> Tuple[
         Dict[MetricConfigurationID, MetricValue],
         _AbortedMetricsInfoDict,
     ]:
-        resolved_metrics: Dict[MetricConfigurationID, MetricValue] = {}
+        resolved_metrics: Dict[MetricConfigurationID, MetricValue] = dict(
+            initial_resolved_metrics or {}
+        )
 
         # updates graph with aborted metrics
         aborted_metrics_info: _AbortedMetricsInfoDict = self._resolve(
@@ -221,6 +233,7 @@ class ValidationGraph:
             runtime_configuration=runtime_configuration,
             min_graph_edges_pbar_enable=min_graph_edges_pbar_enable,
             show_progress_bars=show_progress_bars,
+            failed_metric_info=dict(initial_failed_metric_info or {}),
         )
 
         return resolved_metrics, aborted_metrics_info
@@ -231,6 +244,7 @@ class ValidationGraph:
         runtime_configuration: Optional[dict] = None,
         min_graph_edges_pbar_enable: int = 0,  # Set to low number (e.g., 3) to suppress progress bar for small graphs.  # noqa: E501 # FIXME CoP
         show_progress_bars: bool = True,
+        failed_metric_info: Optional[_AbortedMetricsInfoDict] = None,
     ) -> _AbortedMetricsInfoDict:
         if metrics is None:
             metrics = {}
@@ -243,8 +257,14 @@ class ValidationGraph:
         else:
             catch_exceptions = False
 
-        failed_metric_info: _AbortedMetricsInfoDict = {}
-        aborted_metrics_info: _AbortedMetricsInfoDict = {}
+        if failed_metric_info is None:
+            failed_metric_info = {}
+        # Failures carried over from a previous incremental resolution (an earlier
+        # dependency layer) stay failures: they must not be recomputed and they are
+        # reported as aborted as soon as the graph reaches them again. Within a
+        # single resolution the MAX_METRIC_COMPUTATION_RETRIES retry budget is still
+        # applied to newly raised MetricResolutionError instances.
+        aborted_metrics_info: _AbortedMetricsInfoDict = dict(failed_metric_info)
 
         ready_metrics: Set[MetricConfiguration]
         needed_metrics: Set[MetricConfiguration]
@@ -275,10 +295,14 @@ class ValidationGraph:
             computable_metrics = set()
 
             for metric in ready_metrics:
-                if (
-                    metric.id in failed_metric_info
-                    and failed_metric_info[metric.id]["num_failures"]
+                if metric.id in failed_metric_info and (
+                    # A metric that already failed in an earlier incremental
+                    # resolution (e.g. a previous dependency layer) must never be
+                    # recomputed; within a single resolution the historical retry
+                    # budget of MAX_METRIC_COMPUTATION_RETRIES still applies.
+                    failed_metric_info[metric.id]["num_failures"]
                     >= MAX_METRIC_COMPUTATION_RETRIES
+                    or metric.id in aborted_metrics_info
                 ):
                     aborted_metrics_info[metric.id] = failed_metric_info[metric.id]
                 else:

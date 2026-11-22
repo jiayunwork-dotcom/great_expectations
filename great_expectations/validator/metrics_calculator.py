@@ -250,6 +250,8 @@ class MetricsCalculator:
         runtime_configuration: Optional[dict] = None,
         min_graph_edges_pbar_enable: int = 0,
         # Set to low number (e.g., 3) to suppress progress bar for small graphs.
+        initial_resolved_metrics: Optional[_MetricsDict] = None,
+        initial_failed_metric_info: Optional[_AbortedMetricsInfoDict] = None,
     ) -> Tuple[_MetricsDict, _AbortedMetricsInfoDict]:
         """
         Calls "ValidationGraph.resolve()" method with supplied arguments.
@@ -258,6 +260,8 @@ class MetricsCalculator:
             graph: "ValidationGraph" object, containing "metric_edge" structures with "MetricConfiguration" objects.
             runtime_configuration: Additional run-time settings (see "Validator.DEFAULT_RUNTIME_CONFIGURATION").
             min_graph_edges_pbar_enable: Minimum number of graph edges to warrant showing progress bars.
+            initial_resolved_metrics: Metrics already resolved during an earlier incremental resolution.
+            initial_failed_metric_info: Metric failures recorded during an earlier incremental resolution.
 
         Returns:
             Dictionary with requested metrics resolved, with unique metric ID as key and computed metric as value.
@@ -269,5 +273,7 @@ class MetricsCalculator:
             runtime_configuration=runtime_configuration,
             min_graph_edges_pbar_enable=min_graph_edges_pbar_enable,
             show_progress_bars=self._show_progress_bars,
+            initial_resolved_metrics=initial_resolved_metrics,
+            initial_failed_metric_info=initial_failed_metric_info,
         )
         return resolved_metrics, aborted_metrics_info
